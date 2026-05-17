@@ -1,4 +1,4 @@
-# VS-Codex Thread Tools v17
+# VS-Codex Thread Tools
 
 Dax Liniere 2026.
 

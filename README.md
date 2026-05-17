@@ -18,13 +18,9 @@ SQLite support is intentionally not included yet. Current releases only edit `se
 
 MIT License. See `LICENSE`.
 
-## Privacy warning
-
-Your `.codex` directory can contain private chat transcripts, file paths, project names, prompts, command output, token records, and other local development details. Do not upload your real `.codex` files, screenshots, or generated logs to a public repository unless you have reviewed them carefully.
-
 ## Default Codex paths
 
-The app uses the current user's home/profile directory by default. It does **not** hard-code `C:\Users\dax`.
+The app uses the current user's home/profile directory by default.
 
 Typical Windows paths:
 
@@ -135,55 +131,36 @@ or:
 build_exe.bat debug
 ```
 
-## Publishing to GitHub
-
-Commit the source files, not your build output or private Codex data.
-
-Recommended repository contents:
-
-```text
-vs_codex_thread_tools.py
-README.md
-LICENSE
-.gitignore
-requirements-build.txt
-build_exe.bat
-build_debug_exe.bat
-run_from_source.bat
-```
-
-Do not commit:
-
-```text
-dist/
-build/
-.venv_build/
-__pycache__/
-*.pyc
-*.spec
-build_output.log
-*.jsonl
-*.sqlite
-*.db
-*.log
-```
-
 If you want to distribute the compiled EXE, attach it to a GitHub Release rather than committing it directly to the repository.
 
-For GitHub's web upload flow, extract this zip first, then drag the extracted files into the new repository. GitHub will store the zip itself as a single file if you upload it directly.
-
-## Files in this package
-
-- `vs_codex_thread_tools.py`
-- `run_from_source.bat`
-- `build_exe.bat`
-- `build_debug_exe.bat`
-- `requirements-build.txt`
-- `README.md`
-- `LICENSE`
-- `.gitignore`
 
 ## Changelog
+
+### v21
+
+- Search now uses the same readable message parser as the Reader.
+- Search message-type filters now include User, Assistant final answer, Assistant commentary, Developer instructions, tool output/calls, reasoning, and status events.
+- Search finds matches in Assistant final answers by default, which fixes cases where a word was visible in the Reader but not found by Search.
+- Reader Find invalidates old match positions as soon as the query text changes.
+- Table column widths are saved immediately after resize as well as on close.
+
+### v20
+
+- Fixed Reader Find so changing the search text re-runs the search instead of reusing stale match positions.
+- Search-result clicks now open the Reader at the matched transcript line and prefer the match nearest that line.
+- Main and Reader windows remember size and position.
+- Rename, Search, and Reader thread-list column widths are saved to `settings.ini` and restored on next launch.
+
+### v19
+
+- Added macOS/POSIX process detection for VS Code-like apps before startup/save operations.
+- Removed debug build scripts from the distribution package.
+- Simplified the Windows and macOS build scripts to produce normal GUI builds only.
+
+### v18
+
+- Added `build_app.command`, the macOS equivalent of `build_exe.bat`, to build `dist/VS-Codex Thread Tools.app`.
+- Updated README guidance for macOS paths and app-bundle packaging.
 
 ### v17
 

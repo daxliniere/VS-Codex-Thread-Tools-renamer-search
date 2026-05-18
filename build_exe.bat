@@ -6,15 +6,8 @@ set APP_NAME=VS-Codex Thread Tools
 set MAIN_SCRIPT=vs_codex_thread_tools.py
 set VENV_DIR=.venv_build
 set LOG_FILE=build_output.log
-set BUILD_MODE=windowed
-set WINDOW_FLAG=--windowed
 
-if /I "%~1"=="debug" (
-    set BUILD_MODE=debug-console
-    set WINDOW_FLAG=--console
-)
-
-echo Building %APP_NAME% (%BUILD_MODE%)...
+echo Building %APP_NAME%...
 echo Build log will be written to: %CD%\%LOG_FILE%
 echo.
 
@@ -55,7 +48,7 @@ python -m PyInstaller ^
     --noconfirm ^
     --clean ^
     --onefile ^
-    %WINDOW_FLAG% ^
+    --windowed ^
     --name "%APP_NAME%" ^
     --hidden-import collections.abc ^
     "%MAIN_SCRIPT%" >> "%LOG_FILE%" 2>&1
@@ -70,10 +63,6 @@ echo.
 echo Build complete.
 echo Your executable is here:
 echo %CD%\dist\%APP_NAME%.exe
-echo.
-echo If the windowed EXE exits without showing a window, run:
-echo build_exe.bat debug
-echo Then launch the debug EXE from Command Prompt so any startup traceback stays visible.
 echo.
 echo Runtime crash log, if created:
 echo %%LOCALAPPDATA%%\VS-Codex Thread Tools\crash.log

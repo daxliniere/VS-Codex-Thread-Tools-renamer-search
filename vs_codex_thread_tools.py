@@ -1,12 +1,12 @@
 """
 VS-Codex Thread Tools
 
-A small Windows/Tkinter GUI for renaming, searching, and reading Codex VS Code extension threads.
+A small Tkinter GUI for renaming, searching, and reading Codex VS Code extension threads.
 
 It can:
   1. Rename thread titles in .codex/session_index.jsonl.
   2. Rename matching thread_name values or matching title strings in .codex/sessions/**/*.jsonl.
-  3. Search user/developer message content across session JSONL files.
+  3. Search readable message content across session JSONL files.
   4. Read session JSONL files as a human-friendly chat transcript.
 
 Safety features:
@@ -43,7 +43,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "VS-Codex Thread Tools"
-APP_VERSION = "v17"
+APP_VERSION = "v21"
 APP_FOLDER_NAME = "VS-Codex Thread Tools"
 COPYRIGHT_LINE = "Dax Liniere 2026."
 DEFAULT_INDEX_RELATIVE = Path(".codex") / "session_index.jsonl"
@@ -52,14 +52,28 @@ UUID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
 
-# VS Code proper normally appears as Code.exe. The other names are included for
-# common VS Code-like tools that may use or touch the same Codex files.
-VSCODE_PROCESS_NAMES = (
+# VS Code proper normally appears as Code.exe on Windows. On macOS the visible
+# process can be Electron/Code Helper, so we match the app bundle path in the
+# command line instead of looking for only one executable name.
+WINDOWS_VSCODE_PROCESS_NAMES = (
     "Code.exe",
     "Code - Insiders.exe",
     "VSCodium.exe",
     "Cursor.exe",
     "Windsurf.exe",
+)
+
+POSIX_VSCODE_PROCESS_PATTERNS = (
+    ("Visual Studio Code", ("visual studio code.app",)),
+    ("Visual Studio Code - Insiders", ("visual studio code - insiders.app",)),
+    ("VSCodium", ("vscodium.app",)),
+    ("Cursor", ("cursor.app",)),
+    ("Windsurf", ("windsurf.app",)),
+    # Linux/common POSIX process-command fallbacks. These are deliberately more
+    # specific than just "code" to avoid matching unrelated commands.
+    ("Code", ("/usr/share/code/code", "/snap/code/", "/bin/code --", "/bin/code ")),
+    ("Code - Insiders", ("/usr/share/code-insiders/code-insiders", "/bin/code-insiders ")),
+    ("VSCodium", ("/usr/share/codium/codium", "/bin/codium ")),
 )
 
 
@@ -401,7 +415,22 @@ def split_text_with_local_file_links(text: str) -> List[Tuple[str, Optional[Loca
 
 
 def friendly_role(role: str) -> str:
-    lookup = {"user": "User", "developer": "Developer"}
+    lookup = {
+        "user": "User",
+        "developer": "Developer",
+        "assistant": "Assistant commentary",
+        "assistant_final": "Assistant final answer",
+        "tool_call": "Tool call",
+        "tool_calls": "Tool calls",
+        "tool_output": "Tool output",
+        "tool_outputs": "Tool output",
+        "reasoning": "Reasoning",
+        "event": "Status event",
+        "events": "Status events",
+        "tokens": "Token usage",
+        "credits": "Credits",
+        "credits_verbose": "Credits (verbose)",
+    }
     return lookup.get(role.lower(), role[:1].upper() + role[1:])
 
 
@@ -496,6 +525,39 @@ def save_settings(config: configparser.ConfigParser) -> None:
         config.write(f)
 
 
+def ensure_config_section(config: configparser.ConfigParser, section: str) -> None:
+    if not config.has_section(section):
+        config.add_section(section)
+
+
+def config_int(config: configparser.ConfigParser, section: str, option: str, fallback: int) -> int:
+    try:
+        value = config.getint(section, option, fallback=fallback)
+        return int(value)
+    except Exception:
+        return fallback
+
+
+def save_tree_columns(config: configparser.ConfigParser, section: str, tree: Optional[ttk.Treeview], columns: Sequence[str]) -> None:
+    if tree is None:
+        return
+    try:
+        ensure_config_section(config, section)
+        for column in columns:
+            config.set(section, column, str(int(tree.column(column, option="width"))))
+    except Exception:
+        pass
+
+
+def apply_tree_columns(config: configparser.ConfigParser, section: str, tree: ttk.Treeview, defaults: Dict[str, int]) -> None:
+    for column, default_width in defaults.items():
+        width = config_int(config, section, column, default_width)
+        try:
+            tree.column(column, width=max(30, width))
+        except Exception:
+            pass
+
+
 def write_crash_log(exc: BaseException) -> Path:
     path = crash_log_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -515,52 +577,78 @@ def write_crash_log(exc: BaseException) -> Path:
 
 
 def running_vscode_processes() -> List[str]:
-    """Return names of running VS Code-like processes on Windows.
+    """Return names of running VS Code-like processes.
 
-    Uses tasklist so the app has no dependency on psutil. On non-Windows
-    platforms this returns an empty list because the target app is Windows.
+    Uses tasklist on Windows and ps on macOS/Linux so the app has no dependency
+    on psutil. The macOS check matches app-bundle paths such as
+    "Visual Studio Code.app" because the actual executable can appear as
+    Electron or Code Helper.
     """
-    if platform.system().lower() != "windows":
+    system = platform.system().lower()
+    running: List[str] = []
+
+    if system == "windows":
+        create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+        for process_name in WINDOWS_VSCODE_PROCESS_NAMES:
+            try:
+                result = subprocess.run(
+                    [
+                        "tasklist",
+                        "/FI",
+                        f"IMAGENAME eq {process_name}",
+                        "/FO",
+                        "CSV",
+                        "/NH",
+                    ],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=create_no_window,
+                    check=False,
+                )
+            except Exception:
+                continue
+
+            output = result.stdout.strip()
+            if not output or output.upper().startswith("INFO:"):
+                continue
+
+            try:
+                rows = list(csv.reader(output.splitlines()))
+            except Exception:
+                rows = []
+
+            for row in rows:
+                if not row:
+                    continue
+                found_name = row[0].strip().strip('"')
+                if found_name.lower() == process_name.lower():
+                    running.append(found_name)
+                    break
+
+        return sorted(set(running), key=str.lower)
+
+    # macOS/Linux: inspect process command lines. This is intentionally
+    # best-effort: it is for safety warnings, not process control.
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "comm=,args="],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except Exception:
         return []
 
-    running: List[str] = []
-    create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-
-    for process_name in VSCODE_PROCESS_NAMES:
-        try:
-            result = subprocess.run(
-                [
-                    "tasklist",
-                    "/FI",
-                    f"IMAGENAME eq {process_name}",
-                    "/FO",
-                    "CSV",
-                    "/NH",
-                ],
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                creationflags=create_no_window,
-                check=False,
-            )
-        except Exception:
+    for line in result.stdout.splitlines():
+        haystack = line.lower()
+        if not haystack.strip():
             continue
-
-        output = result.stdout.strip()
-        if not output or output.upper().startswith("INFO:"):
-            continue
-
-        try:
-            rows = list(csv.reader(output.splitlines()))
-        except Exception:
-            rows = []
-
-        for row in rows:
-            if not row:
-                continue
-            found_name = row[0].strip().strip('"')
-            if found_name.lower() == process_name.lower():
-                running.append(found_name)
+        for label, patterns in POSIX_VSCODE_PROCESS_PATTERNS:
+            if any(pattern in haystack for pattern in patterns):
+                running.append(label)
                 break
 
     return sorted(set(running), key=str.lower)
@@ -958,7 +1046,12 @@ def extract_text_from_content(value: Any) -> str:
 
 
 def extract_role_messages(obj: Any, selected_roles: Sequence[str]) -> List[Tuple[str, str]]:
-    """Return (role, text) pairs for message records in one JSONL object."""
+    """Return (role, text) pairs for message records in one JSONL object.
+
+    Kept for backwards compatibility with old search code. v21 search uses the
+    same parsed message model as the Reader so Assistant final/commentary and
+    other readable transcript items can be searched too.
+    """
     if not isinstance(obj, dict):
         return []
 
@@ -967,9 +1060,6 @@ def extract_role_messages(obj: Any, selected_roles: Sequence[str]) -> List[Tuple
     if not isinstance(payload, dict):
         return []
 
-    # Codex session files store the important searchable messages as
-    # {"type":"response_item","payload":{"type":"message","role":"user",...}}
-    # or role="developer". Search this canonical structure first.
     role = payload.get("role")
     payload_type = payload.get("type")
     if isinstance(role, str) and role.lower() in selected and payload_type == "message":
@@ -1004,7 +1094,7 @@ def make_snippet(text: str, needle: str, radius: int = 120) -> str:
 def search_session_file(
     session_file: Path,
     query: str,
-    roles: Sequence[str],
+    filters: Dict[str, bool],
     index_records: Dict[str, ThreadRecord],
 ) -> Optional[SearchResult]:
     thread_id = extract_thread_id_from_filename(session_file)
@@ -1021,17 +1111,22 @@ def search_session_file(
     )
 
     try:
-        with session_file.open("r", encoding="utf-8-sig") as f:
-            for line_no, line in enumerate(f, 1):
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                try:
-                    obj = json.loads(stripped)
-                except json.JSONDecodeError:
-                    continue
+        messages = parse_chat_messages(session_file, filters)
+    except OSError:
+        return None
+    except Exception:
+        messages = []
 
-                if not result.thread_id:
+    # If the file name did not contain a thread id, look inside the first few
+    # parsed lines by falling back to a lightweight JSON scan.
+    if not result.thread_id:
+        try:
+            with session_file.open("r", encoding="utf-8-sig") as f:
+                for line in f:
+                    try:
+                        obj = json.loads(line.strip())
+                    except Exception:
+                        continue
                     possible_id = find_thread_id_in_object(obj)
                     if possible_id:
                         result.thread_id = possible_id.lower()
@@ -1039,24 +1134,27 @@ def search_session_file(
                         if record:
                             result.title = record.old_name
                             result.updated_at = record.updated_at
+                        break
+        except OSError:
+            pass
 
-                for role, text in extract_role_messages(obj, roles):
-                    match_count = count_case_insensitive(text, query)
-                    if not match_count:
-                        continue
-                    result.total_matches += match_count
-                    result.roles[role] += match_count
-                    if len(result.hits) < 20:
-                        result.hits.append(
-                            SearchHit(
-                                role=role,
-                                line_number=line_no,
-                                count=match_count,
-                                snippet=make_snippet(text, query),
-                            )
-                        )
-    except OSError:
-        return None
+    for message in messages:
+        haystack_parts = [message.text or ""] + [str(path) for path in message.images]
+        text_for_count = "\n".join(part for part in haystack_parts if part)
+        match_count = count_case_insensitive(text_for_count, query)
+        if not match_count:
+            continue
+        result.total_matches += match_count
+        result.roles[message.kind] += match_count
+        if len(result.hits) < 20:
+            result.hits.append(
+                SearchHit(
+                    role=message.kind,
+                    line_number=message.line_number,
+                    count=match_count,
+                    snippet=make_snippet(text_for_count, query),
+                )
+            )
 
     return result if result.total_matches else None
 
@@ -1390,6 +1488,30 @@ def selected_reader_filter_names(app: "VSCodexThreadToolsApp") -> Dict[str, bool
     }
 
 
+
+
+SEARCH_FILTER_LABELS: List[Tuple[str, str]] = [
+    ("user", "User"),
+    ("assistant_final", "Assistant final answer"),
+    ("assistant", "Assistant commentary"),
+    ("developer", "Developer instructions"),
+    ("tool_outputs", "Tool output"),
+    ("tool_calls", "Tool calls"),
+    ("reasoning", "Reasoning records"),
+    ("events", "Status events"),
+]
+
+SEARCH_FILTER_DEFAULTS: Dict[str, bool] = {
+    "user": True,
+    "assistant_final": True,
+    "assistant": False,
+    "developer": True,
+    "tool_outputs": False,
+    "tool_calls": False,
+    "reasoning": False,
+    "events": False,
+}
+
 READER_FILTER_LABELS: List[Tuple[str, str]] = [
     ("user", "User"),
     ("assistant", "Assistant commentary"),
@@ -1617,17 +1739,28 @@ class VSCodexThreadToolsApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(APP_NAME)
-        self.root.geometry("1120x720")
+        self.config = load_settings()
+        self.root.geometry(self._setting("windows", "main_geometry", "1120x720"))
         self.root.minsize(920, 560)
 
-        self.config = load_settings()
+        
         self.index_path_var = tk.StringVar(value=self._setting("paths", "index", str(default_index_path())))
         self.sessions_path_var = tk.StringVar(value=self._setting("paths", "sessions", str(default_sessions_path())))
         self.status_var = tk.StringVar(value="Choose a tool to begin.")
 
         self.search_query_var = tk.StringVar()
-        self.search_user_var = tk.BooleanVar(value=self._setting_bool("search", "role_user", True))
-        self.search_developer_var = tk.BooleanVar(value=self._setting_bool("search", "role_developer", True))
+        self.search_filter_vars: Dict[str, tk.BooleanVar] = {
+            key: tk.BooleanVar(value=self._setting_bool("search", f"show_{key}", default))
+            for key, default in SEARCH_FILTER_DEFAULTS.items()
+        }
+
+        # Backwards compatibility for settings.ini files from older versions that
+        # only had user/developer search-role checkboxes.
+        if self.config.has_section("search"):
+            if self.config.has_option("search", "role_user") and not self.config.has_option("search", "show_user"):
+                self.search_filter_vars["user"].set(self._setting_bool("search", "role_user", True))
+            if self.config.has_option("search", "role_developer") and not self.config.has_option("search", "show_developer"):
+                self.search_filter_vars["developer"].set(self._setting_bool("search", "role_developer", True))
 
         self.apply_v11_reader_default_migration()
         self.read_user_var = tk.BooleanVar(value=self._setting_bool("reader", "show_user", True))
@@ -1695,6 +1828,7 @@ class VSCodexThreadToolsApp:
             return fallback
 
     def persist_settings(self) -> None:
+        self.save_current_layout()
         if not self.config.has_section("paths"):
             self.config.add_section("paths")
         self.config.set("paths", "index", self.index_path_var.get())
@@ -1702,8 +1836,12 @@ class VSCodexThreadToolsApp:
 
         if not self.config.has_section("search"):
             self.config.add_section("search")
-        self.config.set("search", "role_user", "yes" if self.search_user_var.get() else "no")
-        self.config.set("search", "role_developer", "yes" if self.search_developer_var.get() else "no")
+        for key, var in self.search_filter_vars.items():
+            self.config.set("search", f"show_{key}", "yes" if var.get() else "no")
+        # Keep the old keys in sync so older v20 builds still behave sensibly if
+        # a user rolls back.
+        self.config.set("search", "role_user", "yes" if self.search_filter_vars.get("user", tk.BooleanVar(value=True)).get() else "no")
+        self.config.set("search", "role_developer", "yes" if self.search_filter_vars.get("developer", tk.BooleanVar(value=True)).get() else "no")
 
         if not self.config.has_section("reader"):
             self.config.add_section("reader")
@@ -1721,8 +1859,25 @@ class VSCodexThreadToolsApp:
         self.config.set("reader", "defaults_migrated_v11", "yes")
         save_settings(self.config)
 
+    def save_current_layout(self) -> None:
+        try:
+            ensure_config_section(self.config, "windows")
+            if self.root.winfo_exists():
+                self.config.set("windows", "main_geometry", self.root.geometry())
+        except Exception:
+            pass
+        save_tree_columns(self.config, "columns_rename", self.rename_tree, ("old_name", "new_name"))
+        save_tree_columns(self.config, "columns_search", self.search_tree, ("title", "matches", "roles", "updated", "filesize", "file"))
+        save_tree_columns(self.config, "columns_reader_main", self.reader_tree, ("title", "updated", "filesize", "file"))
+        if self.search_reader_window is not None and self.search_reader_window.is_alive():
+            self.search_reader_window.save_layout(write=False)
+
     def clear_root(self) -> None:
         self.cancel_edit()
+        try:
+            self.persist_settings()
+        except Exception:
+            pass
         for child in self.root.winfo_children():
             # Keep independent Reader windows alive when switching the main window
             # between Menu/Rename/Search pages. Toplevels are still closed when the
@@ -1816,6 +1971,7 @@ class VSCodexThreadToolsApp:
         tree.heading("new_name", text="New thread name")
         tree.column("old_name", width=500, minwidth=220, stretch=True)
         tree.column("new_name", width=500, minwidth=220, stretch=True)
+        apply_tree_columns(self.config, "columns_rename", tree, {"old_name": 500, "new_name": 500})
         tree.tag_configure("changed", background="#fff3bf")
 
         y_scroll = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=tree.yview)
@@ -1830,6 +1986,7 @@ class VSCodexThreadToolsApp:
 
         tree.bind("<Double-1>", self.begin_edit_cell)
         tree.bind("<F2>", self.begin_edit_selected)
+        tree.bind("<ButtonRelease-1>", lambda event: self.persist_settings(), add="+")
 
         status = ttk.Label(outer, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
         status.pack(fill=tk.X, pady=(8, 0))
@@ -2147,9 +2304,11 @@ class VSCodexThreadToolsApp:
 
         role_frame = ttk.Frame(outer)
         role_frame.pack(fill=tk.X, pady=(0, 8))
-        ttk.Label(role_frame, text="Roles:").pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Checkbutton(role_frame, text="user", variable=self.search_user_var, command=self.persist_settings).pack(side=tk.LEFT)
-        ttk.Checkbutton(role_frame, text="developer", variable=self.search_developer_var, command=self.persist_settings).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(role_frame, text="Message types:").pack(side=tk.LEFT, padx=(0, 8))
+        for key, label in SEARCH_FILTER_LABELS:
+            var = self.search_filter_vars.get(key)
+            if var is not None:
+                ttk.Checkbutton(role_frame, text=label, variable=var, command=self.persist_settings).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Label(role_frame, text=f"Settings file: {settings_path()}").pack(side=tk.RIGHT)
 
         paned = ttk.Panedwindow(outer, orient=tk.VERTICAL)
@@ -2175,6 +2334,7 @@ class VSCodexThreadToolsApp:
         tree.column("updated", width=155, minwidth=120, stretch=False)
         tree.column("filesize", width=90, minwidth=80, stretch=False, anchor=tk.E)
         tree.column("file", width=420, minwidth=180, stretch=True)
+        apply_tree_columns(self.config, "columns_search", tree, {"title": 340, "matches": 80, "roles": 140, "updated": 155, "filesize": 90, "file": 420})
 
         y_scroll = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=tree.yview)
         x_scroll = ttk.Scrollbar(results_frame, orient=tk.HORIZONTAL, command=tree.xview)
@@ -2186,6 +2346,7 @@ class VSCodexThreadToolsApp:
         results_frame.rowconfigure(0, weight=1)
         tree.bind("<<TreeviewSelect>>", self.show_selected_search_result)
         tree.bind("<Double-1>", lambda event: self.open_selected_search_in_reader())
+        tree.bind("<ButtonRelease-1>", lambda event: self.persist_settings(), add="+")
 
         details_toolbar = ttk.Frame(details_frame)
         details_toolbar.pack(fill=tk.X)
@@ -2233,25 +2394,20 @@ class VSCodexThreadToolsApp:
         self.search_results.sort(key=key, reverse=self.search_sort_reverse)
         self.populate_search_results()
 
-    def selected_search_roles(self) -> List[str]:
-        roles = []
-        if self.search_user_var.get():
-            roles.append("user")
-        if self.search_developer_var.get():
-            roles.append("developer")
-        return roles
+    def selected_search_filters(self) -> Dict[str, bool]:
+        return {key: var.get() for key, var in self.search_filter_vars.items()}
 
     def run_search(self) -> None:
         query = self.search_query_var.get().strip()
-        roles = self.selected_search_roles()
+        filters = self.selected_search_filters()
         index_path = Path(self.index_path_var.get()).expanduser()
         sessions_path = Path(self.sessions_path_var.get()).expanduser()
 
         if not query:
             messagebox.showinfo(APP_NAME, "Enter text to search for.", parent=self.root)
             return
-        if not roles:
-            messagebox.showinfo(APP_NAME, "Select at least one role to search.", parent=self.root)
+        if not any(filters.values()):
+            messagebox.showinfo(APP_NAME, "Select at least one message type to search.", parent=self.root)
             return
         if not sessions_path.exists():
             messagebox.showerror(APP_NAME, f"Sessions folder not found:\n{sessions_path}", parent=self.root)
@@ -2270,7 +2426,7 @@ class VSCodexThreadToolsApp:
             total_files = len(session_files)
             results: List[SearchResult] = []
             for idx, session_file in enumerate(session_files, 1):
-                result = search_session_file(session_file, query, roles, index_records)
+                result = search_session_file(session_file, query, filters, index_records)
                 if result is not None:
                     results.append(result)
                 if idx == 1 or idx % 100 == 0 or idx == total_files:
@@ -2462,6 +2618,7 @@ class VSCodexThreadToolsApp:
         tree.column("updated", width=145, minwidth=120, stretch=False)
         tree.column("filesize", width=85, minwidth=75, stretch=False, anchor=tk.E)
         tree.column("file", width=155, minwidth=80, stretch=False)
+        apply_tree_columns(self.config, "columns_reader_main", tree, {"title": 340, "updated": 145, "filesize": 85, "file": 155})
         y_scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=tree.yview)
         x_scroll = ttk.Scrollbar(list_frame, orient=tk.HORIZONTAL, command=tree.xview)
         tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
@@ -2472,6 +2629,7 @@ class VSCodexThreadToolsApp:
         list_frame.rowconfigure(0, weight=1)
         tree.bind("<<TreeviewSelect>>", self.show_selected_chat_thread)
         tree.bind("<Double-1>", self.show_selected_chat_thread)
+        tree.bind("<ButtonRelease-1>", lambda event: self.persist_settings(), add="+")
 
         toolbar = ttk.Frame(transcript_frame)
         toolbar.pack(fill=tk.X)
@@ -2720,6 +2878,8 @@ class VSCodexThreadToolsApp:
             if not close:
                 return
         try:
+            if self.search_reader_window is not None and self.search_reader_window.is_alive():
+                self.search_reader_window.save_layout(write=False)
             self.persist_settings()
         except Exception:
             pass
@@ -2732,7 +2892,7 @@ class ChatReaderWindow:
         self.app = app
         self.window = tk.Toplevel(app.root)
         self.window.title(f"{APP_NAME} - Read chat threads")
-        self.window.geometry("1180x760")
+        self.window.geometry(self.app._setting("windows", "reader_geometry", "1180x760"))
         self.window.minsize(940, 560)
         self.window.protocol("WM_DELETE_WINDOW", self.close)
 
@@ -2750,8 +2910,11 @@ class ChatReaderWindow:
         self.image_tag_counter = 0
         self.local_file_tag_counter = 0
         self.local_file_tags: Dict[str, Path] = {}
-        self.find_matches: List[str] = []
+        self.find_matches: List[Tuple[str, int]] = []
         self.find_index = -1
+        self.find_query_snapshot = ""
+        self._find_trace_enabled = True
+        self.find_var.trace_add("write", self.on_find_text_changed)
         self.filter_checkbuttons: Dict[str, tk.Checkbutton] = {}
         self._building = False
 
@@ -2767,9 +2930,21 @@ class ChatReaderWindow:
             return False
 
     def close(self) -> None:
+        self.save_layout()
         if self.app.search_reader_window is self:
             self.app.search_reader_window = None
         self.window.destroy()
+
+    def save_layout(self, write: bool = True) -> None:
+        try:
+            ensure_config_section(self.app.config, "windows")
+            if self.window.winfo_exists():
+                self.app.config.set("windows", "reader_geometry", self.window.geometry())
+            save_tree_columns(self.app.config, "columns_reader_window", self.reader_tree, ("title", "updated", "filesize", "file"))
+            if write:
+                save_settings(self.app.config)
+        except Exception:
+            pass
 
     def focus(self, session_file: Optional[Path] = None, target_line: Optional[int] = None, search_query: str = "") -> None:
         if session_file is not None:
@@ -2859,6 +3034,7 @@ class ChatReaderWindow:
         tree.column("updated", width=150, minwidth=120, stretch=False)
         tree.column("filesize", width=85, minwidth=75, stretch=False, anchor=tk.E)
         tree.column("file", width=155, minwidth=80, stretch=False)
+        apply_tree_columns(self.app.config, "columns_reader_window", tree, {"title": 360, "updated": 150, "filesize": 85, "file": 155})
         y_scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=tree.yview)
         x_scroll = ttk.Scrollbar(list_frame, orient=tk.HORIZONTAL, command=tree.xview)
         tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
@@ -2870,6 +3046,7 @@ class ChatReaderWindow:
         tree.bind("<<TreeviewSelect>>", self.show_selected_chat_thread)
         tree.bind("<Double-1>", self.show_selected_chat_thread)
         tree.bind("<Button-3>", self.show_thread_context_menu)
+        tree.bind("<ButtonRelease-1>", lambda event: self.save_layout(), add="+")
 
         toolbar = ttk.Frame(transcript_frame)
         toolbar.pack(fill=tk.X)
@@ -3074,6 +3251,7 @@ class ChatReaderWindow:
         self.local_file_tags: Dict[str, Path] = {}
         self.find_matches = []
         self.find_index = -1
+        self.find_query_snapshot = ""
         self.find_status_var.set("")
         text.configure(state=tk.NORMAL)
         text.delete("1.0", tk.END)
@@ -3135,9 +3313,9 @@ class ChatReaderWindow:
         except Exception:
             pass
         text.configure(state=tk.NORMAL)
+        self.run_find(reset=True, quiet=True, prefer_index=target_index)
         if target_index is not None:
             text.see(target_index)
-        self.run_find(reset=True, quiet=True)
         self.update_hidden_find_filter_highlights()
 
     def set_reader_text(self, value: str) -> None:
@@ -3344,7 +3522,23 @@ class ChatReaderWindow:
                     pass
 
 
-    def run_find(self, reset: bool = True, quiet: bool = False) -> None:
+    def on_find_text_changed(self, *_args: Any) -> None:
+        if not getattr(self, "_find_trace_enabled", True):
+            return
+        text = self.reader_text
+        if text is not None:
+            try:
+                text.tag_remove("find_match", "1.0", tk.END)
+                text.tag_remove("find_current", "1.0", tk.END)
+            except Exception:
+                pass
+        self.find_matches = []
+        self.find_index = -1
+        self.find_query_snapshot = ""
+        self.find_status_var.set("")
+        self.update_hidden_find_filter_highlights()
+
+    def run_find(self, reset: bool = True, quiet: bool = False, prefer_index: Optional[str] = None) -> None:
         text = self.reader_text
         if text is None:
             return
@@ -3353,6 +3547,7 @@ class ChatReaderWindow:
         text.tag_remove("find_current", "1.0", tk.END)
         self.find_matches = []
         self.find_index = -1
+        self.find_query_snapshot = query
         if not query:
             self.find_status_var.set("")
             self.update_hidden_find_filter_highlights()
@@ -3368,7 +3563,7 @@ class ChatReaderWindow:
                 break
             end = f"{index}+{length}c"
             text.tag_add("find_match", index, end)
-            self.find_matches.append(index)
+            self.find_matches.append((index, length))
             start = end
         if not self.find_matches:
             self.find_status_var.set("No visible matches")
@@ -3376,6 +3571,14 @@ class ChatReaderWindow:
             return
         if reset:
             self.find_index = 0
+            if prefer_index is not None:
+                for idx, (match_index, _length) in enumerate(self.find_matches):
+                    try:
+                        if text.compare(match_index, ">=", prefer_index):
+                            self.find_index = idx
+                            break
+                    except Exception:
+                        break
         else:
             self.find_index = max(0, min(self.find_index, len(self.find_matches) - 1))
         self.apply_current_find_match()
@@ -3386,9 +3589,8 @@ class ChatReaderWindow:
         if text is None or not self.find_matches:
             return
         text.tag_remove("find_current", "1.0", tk.END)
-        index = self.find_matches[self.find_index]
-        query = self.find_var.get()
-        end = f"{index}+{len(query)}c"
+        index, length = self.find_matches[self.find_index]
+        end = f"{index}+{length}c"
         text.tag_add("find_current", index, end)
         text.see(index)
         self.find_status_var.set(f"{self.find_index + 1} of {len(self.find_matches)}")
@@ -3397,8 +3599,9 @@ class ChatReaderWindow:
         query = self.find_var.get()
         if not query:
             self.find_status_var.set("")
+            self.find_query_snapshot = ""
             return
-        if not self.find_matches:
+        if not self.find_matches or query != self.find_query_snapshot:
             self.run_find(reset=True)
             return
         self.find_index = (self.find_index + 1) % len(self.find_matches)
@@ -3408,8 +3611,9 @@ class ChatReaderWindow:
         query = self.find_var.get()
         if not query:
             self.find_status_var.set("")
+            self.find_query_snapshot = ""
             return
-        if not self.find_matches:
+        if not self.find_matches or query != self.find_query_snapshot:
             self.run_find(reset=True)
             return
         self.find_index = (self.find_index - 1) % len(self.find_matches)

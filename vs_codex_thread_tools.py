@@ -27,11 +27,13 @@ import hashlib
 import json
 import os
 import platform
+import queue
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import traceback
 import urllib.parse
 from collections import Counter
@@ -43,11 +45,12 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 APP_NAME = "VS-Codex Thread Tools"
-APP_VERSION = "v21"
+APP_VERSION = "v27"
 APP_FOLDER_NAME = "VS-Codex Thread Tools"
 COPYRIGHT_LINE = "Dax Liniere 2026."
 DEFAULT_INDEX_RELATIVE = Path(".codex") / "session_index.jsonl"
 DEFAULT_SESSIONS_RELATIVE = Path(".codex") / "sessions"
+DEFAULT_ARCHIVED_SESSIONS_NAME = "archived_sessions"
 UUID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
@@ -84,6 +87,8 @@ class ThreadRecord:
     old_name: str
     new_name: str
     updated_at: str = ""
+    created_at: str = ""
+    archived: bool = False
 
     @property
     def changed(self) -> bool:
@@ -99,12 +104,36 @@ class SearchHit:
 
 
 @dataclass
+class SearchTerm:
+    text: str
+    match_mode: str = "contains"  # contains, exact_phrase, whole_token
+
+    @property
+    def exact_phrase(self) -> bool:
+        return self.match_mode == "exact_phrase"
+
+    @property
+    def whole_token(self) -> bool:
+        return self.match_mode == "whole_token"
+
+
+@dataclass
+class SearchQuery:
+    raw: str
+    terms: List[SearchTerm]
+
+    def primary_display_term(self) -> str:
+        return self.terms[0].text if self.terms else self.raw
+
+
+@dataclass
 class SearchResult:
     thread_id: str
     title: str
     updated_at: str
     session_file: Path
     file_size: int = 0
+    archived: bool = False
     total_matches: int = 0
     roles: Counter = field(default_factory=Counter)
     hits: List[SearchHit] = field(default_factory=list)
@@ -117,6 +146,7 @@ class ChatThread:
     updated_at: str
     session_file: Path
     file_size: int = 0
+    archived: bool = False
 
 
 @dataclass
@@ -430,6 +460,7 @@ def friendly_role(role: str) -> str:
         "tokens": "Token usage",
         "credits": "Credits",
         "credits_verbose": "Credits (verbose)",
+        "other": "Other / raw records",
     }
     return lookup.get(role.lower(), role[:1].upper() + role[1:])
 
@@ -524,6 +555,165 @@ def save_settings(config: configparser.ConfigParser) -> None:
     with path.open("w", encoding="utf-8") as f:
         config.write(f)
 
+
+HISTORY_LIMIT = 15
+
+
+def get_history(config: configparser.ConfigParser, section: str, option: str) -> List[str]:
+    """Return a most-recent-first list of unique history strings."""
+    try:
+        raw = config.get(section, option, fallback="")
+    except Exception:
+        raw = ""
+    values: List[str] = []
+    if raw.strip():
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                values = [str(item).strip() for item in parsed if str(item).strip()]
+        except Exception:
+            values = [line.strip() for line in raw.split("\n") if line.strip()]
+    deduped: List[str] = []
+    seen = set()
+    for value in values:
+        key = value.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(value)
+        if len(deduped) >= HISTORY_LIMIT:
+            break
+    return deduped
+
+
+def remember_history(config: configparser.ConfigParser, section: str, option: str, value: str) -> List[str]:
+    """Store value as the newest entry and return the updated history list."""
+    value = value.strip()
+    history = get_history(config, section, option)
+    if value:
+        history = [item for item in history if item.lower() != value.lower()]
+        history.insert(0, value)
+    history = history[:HISTORY_LIMIT]
+    ensure_config_section(config, section)
+    config.set(section, option, json.dumps(history, ensure_ascii=False))
+    return history
+
+
+def codex_root_from_sessions_path(sessions_root: Path) -> Path:
+    if sessions_root.name.lower() == "sessions":
+        return sessions_root.parent
+    return sessions_root.parent
+
+
+def archived_sessions_path_for(sessions_root: Path) -> Path:
+    return codex_root_from_sessions_path(sessions_root) / DEFAULT_ARCHIVED_SESSIONS_NAME
+
+
+def extract_thread_id_from_filename(path: Path) -> str:
+    match = UUID_RE.search(path.name)
+    return match.group(0).lower() if match else ""
+
+
+def archived_session_ids_for(sessions_root: Path) -> set[str]:
+    archived_dir = archived_sessions_path_for(sessions_root)
+    ids: set[str] = set()
+    if archived_dir.exists():
+        for path in archived_dir.glob("*.jsonl"):
+            thread_id = extract_thread_id_from_filename(path)
+            if thread_id:
+                ids.add(thread_id)
+    return ids
+
+
+def is_archived_session_file(path: Path, archived_ids: set[str], sessions_root: Optional[Path] = None) -> bool:
+    thread_id = extract_thread_id_from_filename(path)
+    if thread_id and thread_id in archived_ids:
+        return True
+    if sessions_root is not None:
+        try:
+            archived_dir = archived_sessions_path_for(sessions_root).resolve()
+            return archived_dir in path.resolve().parents
+        except Exception:
+            return False
+    return False
+
+
+def list_session_jsonl_files(sessions_root: Path) -> List[Path]:
+    files: List[Path] = []
+    if sessions_root.exists():
+        files.extend(path for path in sessions_root.rglob("*.jsonl") if path.is_file())
+    archived_dir = archived_sessions_path_for(sessions_root)
+    if archived_dir.exists():
+        files.extend(path for path in archived_dir.glob("*.jsonl") if path.is_file())
+    seen = set()
+    unique: List[Path] = []
+    for path in files:
+        key = str(path.resolve()).lower() if path.exists() else str(path).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return sorted(unique, key=lambda p: str(p).lower())
+
+
+
+def created_timestamp_from_session_file(path: Path) -> str:
+    """Return the session creation timestamp encoded in rollout filenames, when available."""
+    match = re.search(r"rollout-(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})", path.name, flags=re.IGNORECASE)
+    if match:
+        date_part, hour, minute, second = match.groups()
+        return f"{date_part}T{hour}:{minute}:{second}Z"
+    return ""
+
+
+def session_meta_timestamp(path: Path) -> str:
+    """Read a lightweight creation timestamp from early session metadata if the filename lacks one."""
+    try:
+        with path.open("r", encoding="utf-8-sig") as f:
+            for idx, line in enumerate(f):
+                if idx > 80:
+                    break
+                try:
+                    obj = json.loads(line.strip())
+                except Exception:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                payload = obj.get("payload")
+                if isinstance(payload, dict):
+                    if obj.get("type") == "session_meta" and isinstance(payload.get("timestamp"), str):
+                        return payload["timestamp"]
+                    if isinstance(payload.get("timestamp"), str):
+                        return payload["timestamp"]
+    except OSError:
+        pass
+    return ""
+
+
+def best_created_timestamp_for_thread(sessions_root: Path, thread_id: str) -> str:
+    matches = find_session_files(sessions_root, thread_id)
+    candidates: List[str] = []
+    for path in matches:
+        value = created_timestamp_from_session_file(path) or session_meta_timestamp(path)
+        if value:
+            candidates.append(value)
+    if not candidates:
+        return ""
+    return min(candidates, key=lambda value: parse_codex_datetime(value) or _dt.datetime.max.replace(tzinfo=_dt.timezone.utc))
+
+
+def enrich_thread_records(records: List[ThreadRecord], sessions_root: Path) -> None:
+    """Add derived fields that are not stored directly in session_index.jsonl."""
+    archived_ids = archived_session_ids_for(sessions_root)
+    for record in records:
+        record.archived = record.thread_id.lower() in archived_ids
+        record.created_at = best_created_timestamp_for_thread(sessions_root, record.thread_id)
+
+
+def display_thread_title(title: str, archived: bool = False) -> str:
+    if archived and not title.startswith("[archived] "):
+        return "[archived] " + title
+    return title
 
 def ensure_config_section(config: configparser.ConfigParser, section: str) -> None:
     if not config.has_section(section):
@@ -873,12 +1063,22 @@ def update_index_lines(index_path: Path, changes_by_id: Dict[str, str]) -> Tuple
 
 
 def find_session_files(sessions_root: Path, thread_id: str) -> List[Path]:
-    if not sessions_root.exists():
-        return []
-
     pattern = f"*{thread_id}*.jsonl"
-    matches = [path for path in sessions_root.rglob(pattern) if path.is_file()]
-    return sorted(matches, key=lambda p: str(p).lower())
+    matches: List[Path] = []
+    if sessions_root.exists():
+        matches.extend(path for path in sessions_root.rglob(pattern) if path.is_file())
+    archived_dir = archived_sessions_path_for(sessions_root)
+    if archived_dir.exists():
+        matches.extend(path for path in archived_dir.glob(pattern) if path.is_file())
+    seen = set()
+    unique: List[Path] = []
+    for path in matches:
+        key = str(path.resolve()).lower() if path.exists() else str(path).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return sorted(unique, key=lambda p: str(p).lower())
 
 
 def make_thread_name_updated_event(thread_id: str, new_name: str, newline: str) -> str:
@@ -1001,11 +1201,6 @@ def backup_file(path: Path, backup_root: Path, codex_root: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def extract_thread_id_from_filename(path: Path) -> str:
-    match = UUID_RE.search(path.name)
-    return match.group(0).lower() if match else ""
-
-
 def extract_text_from_content(value: Any) -> str:
     """Extract readable text from Codex message content structures."""
     parts: List[str] = []
@@ -1075,6 +1270,167 @@ def count_case_insensitive(haystack: str, needle: str) -> int:
     return haystack.lower().count(needle.lower())
 
 
+def parse_search_query(raw_query: str) -> SearchQuery:
+    """Parse Search-window query syntax.
+
+    Rules:
+      - foo bar       -> both foo and bar must appear anywhere in the thread.
+      - "foo bar"     -> the exact phrase foo bar must appear.
+      - "foo bar" xyz -> exact phrase foo bar and term xyz must both appear.
+      - "lab"         -> whole-token lab; does not match label/collab.
+      - "lab "        -> exact characters lab followed by a space.
+
+    Matching is case-insensitive. Unquoted terms use the historical substring
+    behaviour, while quoted single tokens now use whole-token matching.
+    """
+    raw = raw_query.strip()
+    terms: List[SearchTerm] = []
+    i = 0
+    n = len(raw)
+
+    while i < n:
+        while i < n and raw[i].isspace():
+            i += 1
+        if i >= n:
+            break
+
+        if raw[i] == '"':
+            i += 1
+            chars: List[str] = []
+            closed = False
+            while i < n:
+                ch = raw[i]
+                if ch == '"':
+                    i += 1
+                    closed = True
+                    break
+                # Let users search for a literal quote with \" inside a phrase.
+                if ch == "\\" and i + 1 < n and raw[i + 1] == '"':
+                    chars.append('"')
+                    i += 2
+                    continue
+                chars.append(ch)
+                i += 1
+            phrase = "".join(chars)
+            if phrase:
+                if phrase == phrase.strip() and re.search(r"\s", phrase) is None:
+                    terms.append(SearchTerm(phrase, match_mode="whole_token"))
+                else:
+                    # Preserve deliberate leading/trailing/internal spaces exactly.
+                    terms.append(SearchTerm(phrase, match_mode="exact_phrase"))
+            continue
+
+        chars = []
+        while i < n and not raw[i].isspace():
+            chars.append(raw[i])
+            i += 1
+        term = "".join(chars).strip()
+        if term:
+            terms.append(SearchTerm(term, match_mode="contains"))
+
+    # If the user typed only quotes/spaces, fall back to the old literal search.
+    if not terms and raw:
+        terms.append(SearchTerm(raw, match_mode="exact_phrase"))
+
+    return SearchQuery(raw=raw, terms=terms)
+
+
+def term_regex(term: SearchTerm) -> Optional[re.Pattern[str]]:
+    if not term.text:
+        return None
+    if term.whole_token:
+        return re.compile(r"(?<![A-Za-z0-9_])" + re.escape(term.text) + r"(?![A-Za-z0-9_])", re.IGNORECASE)
+    return None
+
+
+def text_contains_term(text_lower: str, term: SearchTerm) -> bool:
+    if not term.text:
+        return False
+    if term.whole_token:
+        pattern = term_regex(term)
+        return bool(pattern.search(text_lower)) if pattern is not None else False
+    return term.text.lower() in text_lower
+
+
+def count_term_occurrences(text: str, term: SearchTerm) -> int:
+    if not term.text:
+        return 0
+    if term.whole_token:
+        pattern = term_regex(term)
+        return len(pattern.findall(text)) if pattern is not None else 0
+    return text.lower().count(term.text.lower())
+
+
+def iter_term_spans(text: str, term: SearchTerm) -> List[Tuple[int, int]]:
+    if not term.text:
+        return []
+    if term.whole_token:
+        pattern = term_regex(term)
+        return [(m.start(), m.end()) for m in pattern.finditer(text)] if pattern is not None else []
+    spans: List[Tuple[int, int]] = []
+    needle = term.text.lower()
+    haystack = text.lower()
+    start = 0
+    while True:
+        index = haystack.find(needle, start)
+        if index < 0:
+            break
+        end = index + len(term.text)
+        spans.append((index, end))
+        start = end
+    return spans
+
+
+def query_term_spans(text: str, search_query: SearchQuery) -> List[Tuple[int, int]]:
+    if not text_satisfies_search_query(text, search_query):
+        return []
+    spans: List[Tuple[int, int]] = []
+    for term in search_query.terms:
+        spans.extend(iter_term_spans(text, term))
+    spans.sort(key=lambda item: (item[0], item[1]))
+    # De-dupe exact duplicate spans while preserving order.
+    deduped: List[Tuple[int, int]] = []
+    seen: set[Tuple[int, int]] = set()
+    for span in spans:
+        if span not in seen:
+            seen.add(span)
+            deduped.append(span)
+    return deduped
+
+
+def describe_search_query(search_query: SearchQuery) -> str:
+    if not search_query.terms:
+        return ""
+    pieces: List[str] = []
+    for term in search_query.terms:
+        if term.whole_token:
+            pieces.append(f'"{term.text}" whole token')
+        elif term.exact_phrase:
+            display = term.text.replace("\n", "\\n")
+            pieces.append(f'"{display}" exact characters')
+        else:
+            pieces.append(f'{term.text} anywhere')
+    return "Required: " + "; ".join(pieces)
+
+def text_satisfies_search_query(text: str, search_query: SearchQuery) -> bool:
+    if not search_query.terms:
+        return False
+    text_lower = text.lower()
+    return all(text_contains_term(text_lower, term) for term in search_query.terms)
+
+
+def count_search_query_occurrences(text: str, search_query: SearchQuery) -> int:
+    return sum(count_term_occurrences(text, term) for term in search_query.terms if term.text)
+
+
+def first_present_search_term(text: str, search_query: SearchQuery) -> str:
+    text_lower = text.lower()
+    for term in search_query.terms:
+        if text_contains_term(text_lower, term):
+            return term.text
+    return search_query.primary_display_term()
+
+
 def make_snippet(text: str, needle: str, radius: int = 120) -> str:
     preview_text = display_snippet_text(text, needle)
     collapsed = re.sub(r"\s+", " ", preview_text).strip()
@@ -1091,11 +1447,15 @@ def make_snippet(text: str, needle: str, radius: int = 120) -> str:
     return prefix + collapsed[start:end] + suffix
 
 
+def make_search_query_snippet(text: str, search_query: SearchQuery, radius: int = 120) -> str:
+    return make_snippet(text, first_present_search_term(text, search_query), radius)
+
 def search_session_file(
     session_file: Path,
-    query: str,
+    search_query: SearchQuery,
     filters: Dict[str, bool],
     index_records: Dict[str, ThreadRecord],
+    archived: bool = False,
 ) -> Optional[SearchResult]:
     thread_id = extract_thread_id_from_filename(session_file)
     record = index_records.get(thread_id.lower()) if thread_id else None
@@ -1108,6 +1468,7 @@ def search_session_file(
         updated_at=updated_at,
         session_file=session_file,
         file_size=file_size_bytes(session_file),
+        archived=archived,
     )
 
     try:
@@ -1138,10 +1499,19 @@ def search_session_file(
         except OSError:
             pass
 
+    per_message_texts: List[Tuple[ChatMessage, str]] = []
     for message in messages:
         haystack_parts = [message.text or ""] + [str(path) for path in message.images]
         text_for_count = "\n".join(part for part in haystack_parts if part)
-        match_count = count_case_insensitive(text_for_count, query)
+        if text_for_count:
+            per_message_texts.append((message, text_for_count))
+
+    thread_text = "\n".join(text for _message, text in per_message_texts)
+    if not text_satisfies_search_query(thread_text, search_query):
+        return None
+
+    for message, text_for_count in per_message_texts:
+        match_count = count_search_query_occurrences(text_for_count, search_query)
         if not match_count:
             continue
         result.total_matches += match_count
@@ -1152,7 +1522,7 @@ def search_session_file(
                     role=message.kind,
                     line_number=message.line_number,
                     count=match_count,
-                    snippet=make_snippet(text_for_count, query),
+                    snippet=make_search_query_snippet(text_for_count, search_query),
                 )
             )
 
@@ -1419,7 +1789,7 @@ def title_from_user_text(text: str) -> str:
     return first_nonempty_line(cleaned, 120)
 
 
-def summarize_session_file(session_file: Path, index_records: Dict[str, ThreadRecord]) -> ChatThread:
+def summarize_session_file(session_file: Path, index_records: Dict[str, ThreadRecord], archived: bool = False) -> ChatThread:
     thread_id = extract_thread_id_from_filename(session_file)
     record = index_records.get(thread_id.lower()) if thread_id else None
     title = record.old_name if record else ""
@@ -1469,6 +1839,7 @@ def summarize_session_file(session_file: Path, index_records: Dict[str, ThreadRe
         updated_at=updated_at or meta_timestamp,
         session_file=session_file,
         file_size=file_size_bytes(session_file),
+        archived=archived,
     )
 
 
@@ -1485,6 +1856,7 @@ def selected_reader_filter_names(app: "VSCodexThreadToolsApp") -> Dict[str, bool
         "tokens": app.read_tokens_var.get(),
         "credits": app.read_credits_var.get(),
         "credits_verbose": app.read_credits_verbose_var.get(),
+        "other": app.read_other_var.get(),
     }
 
 
@@ -1499,17 +1871,19 @@ SEARCH_FILTER_LABELS: List[Tuple[str, str]] = [
     ("tool_calls", "Tool calls"),
     ("reasoning", "Reasoning records"),
     ("events", "Status events"),
+    ("other", "Other / raw records"),
 ]
 
 SEARCH_FILTER_DEFAULTS: Dict[str, bool] = {
     "user": True,
     "assistant_final": True,
-    "assistant": False,
+    "assistant": True,
     "developer": True,
-    "tool_outputs": False,
-    "tool_calls": False,
-    "reasoning": False,
-    "events": False,
+    "tool_outputs": True,
+    "tool_calls": True,
+    "reasoning": True,
+    "events": True,
+    "other": True,
 }
 
 READER_FILTER_LABELS: List[Tuple[str, str]] = [
@@ -1524,6 +1898,7 @@ READER_FILTER_LABELS: List[Tuple[str, str]] = [
     ("tokens", "Token usage"),
     ("credits", "Credits"),
     ("credits_verbose", "Credits (verbose)"),
+    ("other", "Other / raw records"),
 ]
 
 
@@ -1534,20 +1909,41 @@ def all_reader_filters() -> Dict[str, bool]:
 def detect_hidden_find_kinds(session_file: Path, query: str, visible_filters: Dict[str, bool]) -> set[str]:
     if not query:
         return set()
-    query_lower = query.lower()
+    search_query = parse_search_query(query)
+    if not search_query.terms:
+        return set()
     hidden_kinds: set[str] = set()
     try:
         messages = parse_chat_messages(session_file, all_reader_filters())
     except Exception:
         return hidden_kinds
+    hidden_text_by_kind: Dict[str, List[str]] = {}
     for message in messages:
         if visible_filters.get(message.kind, False):
             continue
         haystacks = [message.text or ""] + [str(path) for path in message.images]
-        if any(query_lower in haystack.lower() for haystack in haystacks):
-            hidden_kinds.add(message.kind)
+        hidden_text_by_kind.setdefault(message.kind, []).extend(part for part in haystacks if part)
+    for kind, parts in hidden_text_by_kind.items():
+        if text_satisfies_search_query("\n".join(parts), search_query):
+            hidden_kinds.add(kind)
     return hidden_kinds
 
+
+def format_raw_record(obj: Dict[str, Any]) -> str:
+    top_type = obj.get("type")
+    payload = obj.get("payload")
+    payload_type = payload.get("type") if isinstance(payload, dict) else None
+    heading_bits = []
+    if top_type:
+        heading_bits.append(f"type: {top_type}")
+    if payload_type:
+        heading_bits.append(f"payload: {payload_type}")
+    heading = " | ".join(heading_bits) or "Raw JSONL record"
+    try:
+        body = json.dumps(obj, ensure_ascii=False, indent=2)
+    except Exception:
+        body = str(obj)
+    return trim_for_reader(heading + "\n" + body, limit=16000)
 
 def parse_chat_messages(session_file: Path, filters: Dict[str, bool]) -> List[ChatMessage]:
     messages: List[ChatMessage] = []
@@ -1592,6 +1988,9 @@ def parse_chat_messages(session_file: Path, filters: Dict[str, bool]) -> List[Ch
                 if not isinstance(payload, dict):
                     continue
                 payload_type = payload.get("type")
+
+                if filters.get("other"):
+                    add(timestamp_value, "other", "Other / raw record", format_raw_record(obj), line_no)
 
                 if top_type == "response_item" and payload_type == "message":
                     role = str(payload.get("role") or "").lower()
@@ -1749,6 +2148,16 @@ class VSCodexThreadToolsApp:
         self.status_var = tk.StringVar(value="Choose a tool to begin.")
 
         self.search_query_var = tk.StringVar()
+        self.search_interpretation_var = tk.StringVar(value="")
+        self.search_query_combo: Optional[ttk.Combobox] = None
+        self.search_button: Optional[ttk.Button] = None
+        self.search_spinner_var = tk.StringVar(value="")
+        self.search_spinner_label: Optional[ttk.Label] = None
+        self.search_spinner_after_id: Optional[str] = None
+        self.search_spinner_index = 0
+        self.search_worker: Optional[threading.Thread] = None
+        self.search_queue: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
+        self.search_is_running = False
         self.search_filter_vars: Dict[str, tk.BooleanVar] = {
             key: tk.BooleanVar(value=self._setting_bool("search", f"show_{key}", default))
             for key, default in SEARCH_FILTER_DEFAULTS.items()
@@ -1774,6 +2183,11 @@ class VSCodexThreadToolsApp:
         self.read_tokens_var = tk.BooleanVar(value=self._setting_bool("reader", "show_tokens", False))
         self.read_credits_var = tk.BooleanVar(value=self._setting_bool("reader", "show_credits", True))
         self.read_credits_verbose_var = tk.BooleanVar(value=self._setting_bool("reader", "show_credits_verbose", False))
+        self.read_other_var = tk.BooleanVar(value=self._setting_bool("reader", "show_other", False))
+        try:
+            self.search_query_var.trace_add("write", self.on_search_query_changed)
+        except Exception:
+            pass
 
         self.records: List[ThreadRecord] = []
         self.rename_tree: Optional[ttk.Treeview] = None
@@ -1782,9 +2196,12 @@ class VSCodexThreadToolsApp:
         self.search_results: List[SearchResult] = []
         self.reader_tree: Optional[ttk.Treeview] = None
         self.reader_text: Optional[tk.Text] = None
+        self.find_combo: Optional[ttk.Combobox] = None
         self.chat_threads: List[ChatThread] = []
         self.reader_initial_file: Optional[Path] = None
         self.reader_initial_line: Optional[int] = None
+        self.rename_sort_column = "updated"
+        self.rename_sort_reverse = True
         self.search_sort_column = "updated"
         self.search_sort_reverse = True
         self.reader_sort_column = "updated"
@@ -1856,6 +2273,7 @@ class VSCodexThreadToolsApp:
         self.config.set("reader", "show_tokens", "yes" if self.read_tokens_var.get() else "no")
         self.config.set("reader", "show_credits", "yes" if self.read_credits_var.get() else "no")
         self.config.set("reader", "show_credits_verbose", "yes" if self.read_credits_verbose_var.get() else "no")
+        self.config.set("reader", "show_other", "yes" if self.read_other_var.get() else "no")
         self.config.set("reader", "defaults_migrated_v11", "yes")
         save_settings(self.config)
 
@@ -1866,7 +2284,7 @@ class VSCodexThreadToolsApp:
                 self.config.set("windows", "main_geometry", self.root.geometry())
         except Exception:
             pass
-        save_tree_columns(self.config, "columns_rename", self.rename_tree, ("old_name", "new_name"))
+        save_tree_columns(self.config, "columns_rename", self.rename_tree, ("old_name", "new_name", "updated", "created"))
         save_tree_columns(self.config, "columns_search", self.search_tree, ("title", "matches", "roles", "updated", "filesize", "file"))
         save_tree_columns(self.config, "columns_reader_main", self.reader_tree, ("title", "updated", "filesize", "file"))
         if self.search_reader_window is not None and self.search_reader_window.is_alive():
@@ -1888,6 +2306,8 @@ class VSCodexThreadToolsApp:
         self.rename_tree = None
         self.search_tree = None
         self.search_details = None
+        self.search_button = None
+        self.search_spinner_label = None
         self.reader_tree = None
         self.reader_text = None
 
@@ -1964,14 +2384,18 @@ class VSCodexThreadToolsApp:
         table_frame = ttk.Frame(outer)
         table_frame.pack(fill=tk.BOTH, expand=True)
 
-        columns = ("old_name", "new_name")
+        columns = ("old_name", "new_name", "updated", "created")
         tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
         self.rename_tree = tree
-        tree.heading("old_name", text="Current thread name")
-        tree.heading("new_name", text="New thread name")
-        tree.column("old_name", width=500, minwidth=220, stretch=True)
-        tree.column("new_name", width=500, minwidth=220, stretch=True)
-        apply_tree_columns(self.config, "columns_rename", tree, {"old_name": 500, "new_name": 500})
+        tree.heading("old_name", text="Old thread name", command=lambda: self.sort_rename_records("old_name"))
+        tree.heading("new_name", text="New thread name", command=lambda: self.sort_rename_records("new_name"))
+        tree.heading("updated", text="Last edited", command=lambda: self.sort_rename_records("updated"))
+        tree.heading("created", text="Created", command=lambda: self.sort_rename_records("created"))
+        tree.column("old_name", width=390, minwidth=180, stretch=True)
+        tree.column("new_name", width=390, minwidth=180, stretch=True)
+        tree.column("updated", width=155, minwidth=120, stretch=False)
+        tree.column("created", width=155, minwidth=120, stretch=False)
+        apply_tree_columns(self.config, "columns_rename", tree, {"old_name": 390, "new_name": 390, "updated": 155, "created": 155})
         tree.tag_configure("changed", background="#fff3bf")
 
         y_scroll = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=tree.yview)
@@ -2047,8 +2471,9 @@ class VSCodexThreadToolsApp:
                 messagebox.showerror(APP_NAME, f"Could not load index file:\n{exc}", parent=self.root)
             return
 
+        enrich_thread_records(records, sessions_path)
         self.records = records
-        self.refresh_tree()
+        self.sort_rename_records(self.rename_sort_column, preserve_direction=True)
         self.status_var.set(f"Loaded {len(records)} thread records from {index_path}.")
         self.persist_settings()
 
@@ -2060,7 +2485,63 @@ class VSCodexThreadToolsApp:
         tree.delete(*tree.get_children())
         for idx, record in enumerate(self.records):
             tags = ("changed",) if record.changed else ()
-            tree.insert("", tk.END, iid=str(idx), values=(record.old_name, record.new_name), tags=tags)
+            tree.insert(
+                "",
+                tk.END,
+                iid=str(idx),
+                values=(
+                    display_thread_title(record.old_name, record.archived),
+                    record.new_name,
+                    human_datetime(record.updated_at),
+                    human_datetime(record.created_at),
+                ),
+                tags=tags,
+            )
+
+    def sort_rename_records(self, column: str, preserve_direction: bool = False) -> None:
+        if not preserve_direction:
+            if self.rename_sort_column == column:
+                self.rename_sort_reverse = not self.rename_sort_reverse
+            else:
+                self.rename_sort_column = column
+                self.rename_sort_reverse = column in {"updated", "created"}
+
+        selected_thread_id = None
+        tree = self.rename_tree
+        if tree is not None:
+            selection = tree.selection()
+            if selection:
+                try:
+                    idx = int(selection[0])
+                    if 0 <= idx < len(self.records):
+                        selected_thread_id = self.records[idx].thread_id
+                except Exception:
+                    selected_thread_id = None
+
+        def key(record: ThreadRecord) -> Any:
+            if column == "old_name":
+                value = record.old_name.lower()
+            elif column == "new_name":
+                value = record.new_name.lower()
+            elif column == "updated":
+                value = parse_codex_datetime(record.updated_at) or _dt.datetime.min.replace(tzinfo=_dt.timezone.utc)
+            elif column == "created":
+                value = parse_codex_datetime(record.created_at) or _dt.datetime.min.replace(tzinfo=_dt.timezone.utc)
+            else:
+                value = parse_codex_datetime(record.updated_at) or _dt.datetime.min.replace(tzinfo=_dt.timezone.utc)
+            return value
+
+        self.records.sort(key=key, reverse=self.rename_sort_reverse)
+        self.records.sort(key=lambda record: 1 if record.archived else 0)
+        self.refresh_tree()
+        if selected_thread_id and self.rename_tree is not None:
+            for idx, record in enumerate(self.records):
+                if record.thread_id == selected_thread_id:
+                    item = str(idx)
+                    self.rename_tree.selection_set(item)
+                    self.rename_tree.focus(item)
+                    self.rename_tree.see(item)
+                    break
 
     def reset_unsaved(self) -> None:
         for record in self.records:
@@ -2280,6 +2761,13 @@ class VSCodexThreadToolsApp:
 
     # ------------------------- search page -------------------------
 
+    def on_search_query_changed(self, *_args: Any) -> None:
+        try:
+            search_query = parse_search_query(self.search_query_var.get())
+            self.search_interpretation_var.set(describe_search_query(search_query))
+        except Exception:
+            self.search_interpretation_var.set("")
+
     def show_search(self) -> None:
         self.current_view = "search"
         self.clear_root()
@@ -2290,6 +2778,18 @@ class VSCodexThreadToolsApp:
         header.pack(fill=tk.X)
         ttk.Button(header, text="Back to menu", command=self.show_menu).pack(side=tk.LEFT)
         ttk.Label(header, text="Search Codex chat threads", font=("Segoe UI", 15, "bold")).pack(side=tk.LEFT, padx=(12, 0))
+        # Large search activity indicator. It lives in the title row so it is
+        # obvious even when the results pane is empty or busy. The text is
+        # blank when no search is running.
+        spinner = ttk.Label(
+            header,
+            textvariable=self.search_spinner_var,
+            font=("Segoe UI", 30, "bold"),
+            width=2,
+            anchor=tk.CENTER,
+        )
+        spinner.pack(side=tk.LEFT, padx=(14, 0))
+        self.search_spinner_label = spinner
 
         ttk.Label(outer, text=COPYRIGHT_LINE).pack(anchor=tk.W, pady=(4, 0))
         self.build_paths_frame(outer).pack(fill=tk.X, pady=(10, 0))
@@ -2297,10 +2797,21 @@ class VSCodexThreadToolsApp:
         search_controls = ttk.Frame(outer)
         search_controls.pack(fill=tk.X, pady=(10, 8))
         ttk.Label(search_controls, text="Search text").pack(side=tk.LEFT, padx=(0, 8))
-        query_entry = ttk.Entry(search_controls, textvariable=self.search_query_var)
+        query_entry = ttk.Combobox(
+            search_controls,
+            textvariable=self.search_query_var,
+            values=get_history(self.config, "history", "search_queries"),
+        )
+        self.search_query_combo = query_entry
         query_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
         query_entry.bind("<Return>", lambda event: self.run_search())
-        ttk.Button(search_controls, text="Search", command=self.run_search).pack(side=tk.LEFT, padx=(8, 0))
+        search_button = ttk.Button(search_controls, text="Search", command=self.run_search)
+        search_button.pack(side=tk.LEFT, padx=(8, 0))
+        self.search_button = search_button
+
+        interpretation = ttk.Label(outer, textvariable=self.search_interpretation_var, foreground="#555555")
+        interpretation.pack(fill=tk.X, pady=(0, 6))
+        self.on_search_query_changed()
 
         role_frame = ttk.Frame(outer)
         role_frame.pack(fill=tk.X, pady=(0, 8))
@@ -2378,32 +2889,40 @@ class VSCodexThreadToolsApp:
 
         def key(result: SearchResult) -> Any:
             if column == "title":
-                return result.title.lower()
-            if column == "matches":
-                return result.total_matches
-            if column == "roles":
-                return friendly_roles_text(result.roles).lower()
-            if column == "updated":
-                return parse_codex_datetime(result.updated_at) or _dt.datetime.min.replace(tzinfo=_dt.timezone.utc)
-            if column == "filesize":
-                return result.file_size
-            if column == "file":
-                return friendly_session_label(result.session_file).lower()
-            return result.title.lower()
+                value = result.title.lower()
+            elif column == "matches":
+                value = result.total_matches
+            elif column == "roles":
+                value = friendly_roles_text(result.roles).lower()
+            elif column == "updated":
+                value = parse_codex_datetime(result.updated_at) or _dt.datetime.min.replace(tzinfo=_dt.timezone.utc)
+            elif column == "filesize":
+                value = result.file_size
+            elif column == "file":
+                value = friendly_session_label(result.session_file).lower()
+            else:
+                value = result.title.lower()
+            return value
 
         self.search_results.sort(key=key, reverse=self.search_sort_reverse)
+        self.search_results.sort(key=lambda result: 1 if result.archived else 0)
         self.populate_search_results()
 
     def selected_search_filters(self) -> Dict[str, bool]:
         return {key: var.get() for key, var in self.search_filter_vars.items()}
 
     def run_search(self) -> None:
+        if self.search_is_running:
+            self.status_var.set("Search already running. Please wait for it to finish.")
+            return
+
         query = self.search_query_var.get().strip()
+        search_query = parse_search_query(query)
         filters = self.selected_search_filters()
         index_path = Path(self.index_path_var.get()).expanduser()
         sessions_path = Path(self.sessions_path_var.get()).expanduser()
 
-        if not query:
+        if not query or not search_query.terms:
             messagebox.showinfo(APP_NAME, "Enter text to search for.", parent=self.root)
             return
         if not any(filters.values()):
@@ -2413,36 +2932,114 @@ class VSCodexThreadToolsApp:
             messagebox.showerror(APP_NAME, f"Sessions folder not found:\n{sessions_path}", parent=self.root)
             return
 
+        history = remember_history(self.config, "history", "search_queries", query)
+        if self.search_query_combo is not None:
+            try:
+                self.search_query_combo.configure(values=history)
+            except Exception:
+                pass
         self.persist_settings()
         self.search_results = []
         self.populate_search_results()
         self.set_details_text("Searching...\n")
+        self.status_var.set("Starting search...")
         self.root.configure(cursor="watch")
-        self.root.update_idletasks()
+        if self.search_button is not None:
+            self.search_button.configure(state=tk.DISABLED)
 
+        self.search_is_running = True
+        self.search_queue = queue.Queue()
+        self.start_search_spinner()
+        self.search_worker = threading.Thread(
+            target=self.search_worker_main,
+            args=(index_path, sessions_path, search_query, filters),
+            daemon=True,
+        )
+        self.search_worker.start()
+        self.root.after(50, self.poll_search_queue)
+
+    def start_search_spinner(self) -> None:
+        self.search_spinner_index = 0
+
+        def tick() -> None:
+            if not self.search_is_running:
+                self.search_spinner_var.set("")
+                self.search_spinner_after_id = None
+                return
+            frames = ("◐", "◓", "◑", "◒")
+            self.search_spinner_var.set(frames[self.search_spinner_index % len(frames)])
+            self.search_spinner_index += 1
+            self.search_spinner_after_id = self.root.after(120, tick)
+
+        tick()
+
+    def stop_search_spinner(self) -> None:
+        self.search_is_running = False
+        if self.search_spinner_after_id is not None:
+            try:
+                self.root.after_cancel(self.search_spinner_after_id)
+            except Exception:
+                pass
+            self.search_spinner_after_id = None
+        self.search_spinner_var.set("")
+
+    def search_worker_main(self, index_path: Path, sessions_path: Path, search_query: SearchQuery, filters: Dict[str, bool]) -> None:
         try:
             index_records = parse_index_map(index_path) if index_path.exists() else {}
-            session_files = sorted(sessions_path.rglob("*.jsonl"), key=lambda p: str(p).lower())
+            session_files = list_session_jsonl_files(sessions_path)
+            archived_ids = archived_session_ids_for(sessions_path)
             total_files = len(session_files)
             results: List[SearchResult] = []
+
+            self.search_queue.put(("total", total_files))
             for idx, session_file in enumerate(session_files, 1):
-                result = search_session_file(session_file, query, filters, index_records)
+                result = search_session_file(session_file, search_query, filters, index_records, is_archived_session_file(session_file, archived_ids, sessions_path))
                 if result is not None:
                     results.append(result)
-                if idx == 1 or idx % 100 == 0 or idx == total_files:
-                    self.status_var.set(f"Searched {idx} of {total_files} session file(s); found {len(results)} matching thread(s).")
-                    self.root.update_idletasks()
+                if idx == 1 or idx % 10 == 0 or idx == total_files:
+                    self.search_queue.put(("progress", idx, total_files, len(results)))
 
-            self.search_results = results
-            self.sort_search_results(self.search_sort_column, preserve_direction=True)
-            self.status_var.set(f"Search complete: {plural(len(results), 'matching thread')}, {plural(sum(r.total_matches for r in results), 'total match', 'total matches')}.")
-            if not results:
-                self.set_details_text("No matching chat threads found.\n")
+            self.search_queue.put(("done", results))
         except Exception as exc:
-            messagebox.showerror(APP_NAME, f"Search failed:\n{exc}", parent=self.root)
-            self.status_var.set("Search failed.")
-        finally:
+            self.search_queue.put(("error", str(exc), traceback.format_exc()))
+
+    def poll_search_queue(self) -> None:
+        finished = False
+        try:
+            while True:
+                message = self.search_queue.get_nowait()
+                kind = message[0]
+                if kind == "total":
+                    total_files = message[1]
+                    self.status_var.set(f"Searching {plural(total_files, 'session file')}...")
+                elif kind == "progress":
+                    _, idx, total_files, result_count = message
+                    self.status_var.set(f"Searched {idx} of {total_files} session file(s); found {result_count} matching thread(s).")
+                elif kind == "done":
+                    results = message[1]
+                    self.search_results = results
+                    self.sort_search_results(self.search_sort_column, preserve_direction=True)
+                    self.status_var.set(f"Search complete: {plural(len(results), 'matching thread')}, {plural(sum(r.total_matches for r in results), 'total match', 'total matches')}.")
+                    if not results:
+                        self.set_details_text("No matching chat threads found.\n")
+                    finished = True
+                elif kind == "error":
+                    _, error_text, tb = message
+                    log_runtime(f"Search failed: {error_text}\n{tb}")
+                    messagebox.showerror(APP_NAME, f"Search failed:\n{error_text}", parent=self.root)
+                    self.status_var.set("Search failed.")
+                    finished = True
+        except queue.Empty:
+            pass
+
+        if finished:
+            self.stop_search_spinner()
             self.root.configure(cursor="")
+            if self.search_button is not None:
+                self.search_button.configure(state=tk.NORMAL)
+            self.search_worker = None
+        elif self.search_is_running:
+            self.root.after(50, self.poll_search_queue)
 
     def populate_search_results(self) -> None:
         tree = self.search_tree
@@ -2455,7 +3052,7 @@ class VSCodexThreadToolsApp:
                 tk.END,
                 iid=str(idx),
                 values=(
-                    result.title,
+                    display_thread_title(result.title, result.archived),
                     plural(result.total_matches, "match", "matches"),
                     friendly_roles_text(result.roles),
                     human_datetime(result.updated_at),
@@ -2484,7 +3081,7 @@ class VSCodexThreadToolsApp:
         if result is None:
             return
         lines = [
-            result.title,
+            display_thread_title(result.title, result.archived),
             f"Updated: {human_datetime(result.updated_at) or '(unknown)'}",
             f"Filesize: {human_filesize(result.file_size)}",
             f"Matches: {plural(result.total_matches, 'match', 'matches')}",
@@ -2539,7 +3136,10 @@ class VSCodexThreadToolsApp:
         if result is None:
             return
         target_line = result.hits[0].line_number if result.hits else None
-        self.open_reader_window(result.session_file, target_line, self.search_query_var.get().strip())
+        # Preserve the original query, including quoted trailing spaces, so the
+        # Reader can use the same parsed criteria as Search.
+        reader_find_text = self.search_query_var.get()
+        self.open_reader_window(result.session_file, target_line, reader_find_text)
 
     def open_reader_window(self, session_file: Optional[Path] = None, target_line: Optional[int] = None, search_query: str = "") -> None:
         if self.search_reader_window is None or not self.search_reader_window.is_alive():
@@ -2671,6 +3271,7 @@ class VSCodexThreadToolsApp:
         text.tag_configure("tokens", background="#eef1ff", lmargin1=30, lmargin2=30, rmargin=30, spacing1=4, spacing3=8)
         text.tag_configure("credits", background="#fff0d6", lmargin1=30, lmargin2=30, rmargin=30, spacing1=2, spacing3=2)
         text.tag_configure("credits_verbose", background="#fff0d6", lmargin1=30, lmargin2=30, rmargin=30, spacing1=4, spacing3=8)
+        text.tag_configure("other", background="#eeeeee", lmargin1=30, lmargin2=30, rmargin=30, spacing1=4, spacing3=8)
         try:
             text.tag_raise("sel")
         except Exception:
@@ -2692,11 +3293,12 @@ class VSCodexThreadToolsApp:
         self.root.update_idletasks()
         try:
             index_records = parse_index_map(index_path) if index_path.exists() else {}
-            session_files = sorted(sessions_path.rglob("*.jsonl"), key=lambda p: str(p).lower())
+            session_files = list_session_jsonl_files(sessions_path)
+            archived_ids = archived_session_ids_for(sessions_path)
             threads: List[ChatThread] = []
             total_files = len(session_files)
             for idx, session_file in enumerate(session_files, 1):
-                threads.append(summarize_session_file(session_file, index_records))
+                threads.append(summarize_session_file(session_file, index_records, is_archived_session_file(session_file, archived_ids, sessions_path)))
                 if idx == 1 or idx % 100 == 0 or idx == total_files:
                     self.status_var.set(f"Loaded {idx} of {total_files} chat file(s).")
                     self.root.update_idletasks()
@@ -2724,7 +3326,7 @@ class VSCodexThreadToolsApp:
                 tk.END,
                 iid=str(idx),
                 values=(
-                    thread.title,
+                    display_thread_title(thread.title, thread.archived),
                     human_datetime(thread.updated_at),
                     human_filesize(thread.file_size),
                     friendly_session_label(thread.session_file),
@@ -2755,16 +3357,19 @@ class VSCodexThreadToolsApp:
 
         def key(thread: ChatThread) -> Any:
             if column == "title":
-                return thread.title.lower()
-            if column == "updated":
-                return parse_codex_datetime(thread.updated_at) or _dt.datetime.min.replace(tzinfo=_dt.timezone.utc)
-            if column == "filesize":
-                return thread.file_size
-            if column == "file":
-                return friendly_session_label(thread.session_file).lower()
-            return thread.title.lower()
+                value = thread.title.lower()
+            elif column == "updated":
+                value = parse_codex_datetime(thread.updated_at) or _dt.datetime.min.replace(tzinfo=_dt.timezone.utc)
+            elif column == "filesize":
+                value = thread.file_size
+            elif column == "file":
+                value = friendly_session_label(thread.session_file).lower()
+            else:
+                value = thread.title.lower()
+            return value
 
         self.chat_threads.sort(key=key, reverse=self.reader_sort_reverse)
+        self.chat_threads.sort(key=lambda thread: 1 if thread.archived else 0)
         self.populate_reader_threads()
 
     def selected_chat_thread(self) -> Optional[ChatThread]:
@@ -2803,7 +3408,7 @@ class VSCodexThreadToolsApp:
             return
         text.configure(state=tk.NORMAL)
         text.delete("1.0", tk.END)
-        text.insert(tk.END, thread.title + "\n", ("title",))
+        text.insert(tk.END, display_thread_title(thread.title, thread.archived) + "\n", ("title",))
         meta_parts = []
         if thread.updated_at:
             meta_parts.append(f"Updated: {human_datetime(thread.updated_at)}")
@@ -2822,12 +3427,9 @@ class VSCodexThreadToolsApp:
                 text.insert(tk.END, message.text + "\n", ("credits",))
                 continue
             time_text = human_datetime(message.timestamp)
-            line_info = f"line {message.line_number}" if message.line_number else ""
             header_bits = [message.label]
             if time_text:
                 header_bits.append(time_text)
-            if line_info:
-                header_bits.append(line_info)
             text.insert(tk.END, "  ".join(header_bits) + "\n", ("message_header", message.kind))
             body = message.text.strip()
             text.insert(tk.END, body + "\n\n", (message.kind,))
@@ -2899,8 +3501,10 @@ class ChatReaderWindow:
         self.status_var = tk.StringVar(value="Loading chat threads...")
         self.find_var = tk.StringVar(value=search_query or "")
         self.find_status_var = tk.StringVar(value="")
+        self.hidden_notice_var = tk.StringVar(value="")
         self.reader_tree: Optional[ttk.Treeview] = None
         self.reader_text: Optional[tk.Text] = None
+        self.find_combo: Optional[ttk.Combobox] = None
         self.chat_threads: List[ChatThread] = []
         self.sort_column = "updated"
         self.sort_reverse = True
@@ -2916,6 +3520,7 @@ class ChatReaderWindow:
         self._find_trace_enabled = True
         self.find_var.trace_add("write", self.on_find_text_changed)
         self.filter_checkbuttons: Dict[str, tk.Checkbutton] = {}
+        self.hidden_notice_label: Optional[tk.Label] = None
         self._building = False
 
         self.build_ui()
@@ -2994,6 +3599,7 @@ class ChatReaderWindow:
             "tokens": self.app.read_tokens_var,
             "credits": self.app.read_credits_var,
             "credits_verbose": self.app.read_credits_verbose_var,
+            "other": self.app.read_other_var,
         }
         for idx, (kind, label) in enumerate(READER_FILTER_LABELS):
             check = tk.Checkbutton(
@@ -3014,6 +3620,18 @@ class ChatReaderWindow:
                 pady=2,
             )
             self.filter_checkbuttons[kind] = check
+
+        notice = tk.Label(
+            filter_frame,
+            textvariable=self.hidden_notice_var,
+            background="#fff2a8",
+            foreground="#000000",
+            anchor=tk.W,
+            padx=8,
+        )
+        self.hidden_notice_label = notice
+        notice.grid(row=0, column=5, rowspan=2, sticky="w", padx=(20, 0))
+        notice.grid_remove()
 
         paned = ttk.Panedwindow(outer, orient=tk.HORIZONTAL)
         paned.pack(fill=tk.BOTH, expand=True)
@@ -3052,13 +3670,20 @@ class ChatReaderWindow:
         toolbar.pack(fill=tk.X)
         ttk.Label(toolbar, text="Chat transcript").pack(side=tk.LEFT)
         ttk.Label(toolbar, text="Find").pack(side=tk.LEFT, padx=(18, 4))
-        find_entry = ttk.Entry(toolbar, textvariable=self.find_var, width=26)
+        find_entry = ttk.Combobox(
+            toolbar,
+            textvariable=self.find_var,
+            values=get_history(self.app.config, "history", "reader_find_queries"),
+            width=26,
+        )
+        self.find_combo = find_entry
         find_entry.pack(side=tk.LEFT)
         find_entry.bind("<Return>", lambda event: self.find_next())
         ttk.Button(toolbar, text="Prev", command=self.find_previous).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(toolbar, text="Next", command=self.find_next).pack(side=tk.LEFT, padx=(4, 0))
         ttk.Label(toolbar, textvariable=self.find_status_var).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(toolbar, text="Refresh transcript", command=self.show_selected_chat_thread).pack(side=tk.RIGHT)
+        ttk.Button(toolbar, text="Download Thread", command=self.download_visible_transcript).pack(side=tk.RIGHT, padx=(0, 8))
 
         text = tk.Text(
             transcript_frame,
@@ -3104,6 +3729,7 @@ class ChatReaderWindow:
         text.tag_configure("tokens", background="#eef1ff", lmargin1=30, lmargin2=30, rmargin=30, spacing1=4, spacing3=8)
         text.tag_configure("credits", background="#fff0d6", lmargin1=30, lmargin2=30, rmargin=30, spacing1=2, spacing3=2)
         text.tag_configure("credits_verbose", background="#fff0d6", lmargin1=30, lmargin2=30, rmargin=30, spacing1=4, spacing3=8)
+        text.tag_configure("other", background="#eeeeee", lmargin1=30, lmargin2=30, rmargin=30, spacing1=4, spacing3=8)
         text.tag_configure("target_message", background="#ffe7a3")
         text.tag_configure("image_link", foreground="#003399", background="#fff2a8", underline=True, font=("Segoe UI", 10, "bold"), spacing1=3, spacing3=3)
         text.tag_configure("local_file_link", foreground="#003399", underline=True, font=("Segoe UI", 10, "bold"))
@@ -3130,11 +3756,12 @@ class ChatReaderWindow:
         self.window.update_idletasks()
         try:
             index_records = parse_index_map(index_path) if index_path.exists() else {}
-            session_files = sorted(sessions_path.rglob("*.jsonl"), key=lambda p: str(p).lower())
+            session_files = list_session_jsonl_files(sessions_path)
+            archived_ids = archived_session_ids_for(sessions_path)
             threads: List[ChatThread] = []
             total_files = len(session_files)
             for idx, session_file in enumerate(session_files, 1):
-                threads.append(summarize_session_file(session_file, index_records))
+                threads.append(summarize_session_file(session_file, index_records, is_archived_session_file(session_file, archived_ids, sessions_path)))
                 if idx == 1 or idx % 100 == 0 or idx == total_files:
                     self.status_var.set(f"Loaded {idx} of {total_files} chat file(s).")
                     self.window.update_idletasks()
@@ -3165,16 +3792,19 @@ class ChatReaderWindow:
 
         def key(thread: ChatThread) -> Any:
             if column == "title":
-                return thread.title.lower()
-            if column == "updated":
-                return parse_codex_datetime(thread.updated_at) or _dt.datetime.min.replace(tzinfo=_dt.timezone.utc)
-            if column == "filesize":
-                return thread.file_size
-            if column == "file":
-                return friendly_session_label(thread.session_file).lower()
-            return thread.title.lower()
+                value = thread.title.lower()
+            elif column == "updated":
+                value = parse_codex_datetime(thread.updated_at) or _dt.datetime.min.replace(tzinfo=_dt.timezone.utc)
+            elif column == "filesize":
+                value = thread.file_size
+            elif column == "file":
+                value = friendly_session_label(thread.session_file).lower()
+            else:
+                value = thread.title.lower()
+            return value
 
         self.chat_threads.sort(key=key, reverse=self.sort_reverse)
+        self.chat_threads.sort(key=lambda thread: 1 if thread.archived else 0)
         self.populate_threads()
         if selected_file is not None:
             self.select_reader_file(selected_file)
@@ -3190,7 +3820,7 @@ class ChatReaderWindow:
                 tk.END,
                 iid=str(idx),
                 values=(
-                    thread.title,
+                    display_thread_title(thread.title, thread.archived),
                     human_datetime(thread.updated_at),
                     human_filesize(thread.file_size),
                     friendly_session_label(thread.session_file),
@@ -3255,7 +3885,7 @@ class ChatReaderWindow:
         self.find_status_var.set("")
         text.configure(state=tk.NORMAL)
         text.delete("1.0", tk.END)
-        text.insert(tk.END, thread.title + "\n", ("title",))
+        text.insert(tk.END, display_thread_title(thread.title, thread.archived) + "\n", ("title",))
         meta_parts = []
         if thread.updated_at:
             meta_parts.append(f"Updated: {human_datetime(thread.updated_at)}")
@@ -3285,12 +3915,9 @@ class ChatReaderWindow:
                 continue
 
             time_text = human_datetime(message.timestamp)
-            line_info = f"line {message.line_number}" if message.line_number else ""
             header_bits = [message.label]
             if time_text:
                 header_bits.append(time_text)
-            if line_info:
-                header_bits.append(line_info)
             message_tags = ("message_header", message.kind)
             if self.target_line is not None and message.line_number == self.target_line:
                 message_tags = message_tags + ("target_message",)
@@ -3326,6 +3953,31 @@ class ChatReaderWindow:
         text.delete("1.0", tk.END)
         text.insert("1.0", value)
         text.configure(state=tk.NORMAL)
+
+    def download_visible_transcript(self) -> None:
+        text = self.reader_text
+        thread = self.selected_chat_thread()
+        if text is None or thread is None:
+            messagebox.showinfo(APP_NAME, "Select a thread before downloading.", parent=self.window)
+            return
+        suggested = re.sub(r"[^A-Za-z0-9._ -]+", "_", display_thread_title(thread.title, thread.archived)).strip() or "codex-thread"
+        if len(suggested) > 120:
+            suggested = suggested[:120].rstrip()
+        target = filedialog.asksaveasfilename(
+            parent=self.window,
+            title="Download thread transcript",
+            defaultextension=".txt",
+            initialfile=suggested + ".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if not target:
+            return
+        try:
+            content = text.get("1.0", "end-1c")
+            Path(target).write_text(content, encoding="utf-8")
+            self.status_var.set(f"Transcript saved to {target}")
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"Could not save transcript:\n{exc}", parent=self.window)
 
     def show_thread_context_menu(self, event: tk.Event) -> None:
         tree = self.reader_tree
@@ -3508,19 +4160,51 @@ class ChatReaderWindow:
                 check.configure(background=normal_bg, activebackground=normal_bg)
             except Exception:
                 pass
-        query = self.find_var.get().strip()
+        query = self.find_var.get()
         thread = self.selected_chat_thread()
-        if not query or thread is None:
+        if not query.strip() or thread is None:
+            try:
+                self.hidden_notice_var.set("")
+                if self.hidden_notice_label is not None:
+                    self.hidden_notice_label.grid_remove()
+            except Exception:
+                pass
             return
         hidden_kinds = detect_hidden_find_kinds(thread.session_file, query, selected_reader_filter_names(self.app))
+        highlighted_any = False
         for kind in hidden_kinds:
             check = self.filter_checkbuttons.get(kind)
             if check is not None:
                 try:
                     check.configure(background=highlight_bg, activebackground=highlight_bg)
+                    highlighted_any = True
                 except Exception:
                     pass
+        try:
+            self.hidden_notice_var.set("Search string found in a non-visible message type." if highlighted_any else "")
+            if self.hidden_notice_label is not None:
+                if highlighted_any:
+                    self.hidden_notice_label.grid()
+                else:
+                    self.hidden_notice_label.grid_remove()
+        except Exception:
+            pass
 
+
+    def remember_find_query(self) -> None:
+        query = self.find_var.get().strip()
+        if not query:
+            return
+        history = remember_history(self.app.config, "history", "reader_find_queries", query)
+        if self.find_combo is not None:
+            try:
+                self.find_combo.configure(values=history)
+            except Exception:
+                pass
+        try:
+            save_settings(self.app.config)
+        except Exception:
+            pass
 
     def on_find_text_changed(self, *_args: Any) -> None:
         if not getattr(self, "_find_trace_enabled", True):
@@ -3548,23 +4232,21 @@ class ChatReaderWindow:
         self.find_matches = []
         self.find_index = -1
         self.find_query_snapshot = query
-        if not query:
+        if not query.strip():
             self.find_status_var.set("")
             self.update_hidden_find_filter_highlights()
             return
-        start = "1.0"
-        count = tk.IntVar(value=0)
-        while True:
-            index = text.search(query, start, stopindex=tk.END, nocase=True, count=count)
-            if not index:
-                break
-            length = count.get()
-            if length <= 0:
-                break
-            end = f"{index}+{length}c"
+        self.remember_find_query()
+        search_query = parse_search_query(query)
+        content = text.get("1.0", "end-1c")
+        spans = query_term_spans(content, search_query)
+        for start_offset, end_offset in spans:
+            if end_offset <= start_offset:
+                continue
+            index = f"1.0+{start_offset}c"
+            end = f"1.0+{end_offset}c"
             text.tag_add("find_match", index, end)
-            self.find_matches.append((index, length))
-            start = end
+            self.find_matches.append((index, end_offset - start_offset))
         if not self.find_matches:
             self.find_status_var.set("No visible matches")
             self.update_hidden_find_filter_highlights()
